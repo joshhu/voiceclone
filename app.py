@@ -11,6 +11,8 @@ Qwen3-TTS 聲音複製與語音合成系統（本地版）
 """
 
 import os
+import shutil
+import subprocess
 import tempfile
 import datetime
 
@@ -19,6 +21,7 @@ import numpy as np
 import torch
 import soundfile as sf
 import whisper
+import yt_dlp
 from huggingface_hub import snapshot_download
 from qwen_tts import Qwen3TTSModel
 
@@ -102,6 +105,88 @@ def transcribe_audio(audio):
     except Exception as e:
         _unload_whisper()
         return f"[辨識失敗: {e}]"
+
+
+# ── YouTube 影片擷取 ─────────────────────────────
+_yt_tmpdir = None  # 追蹤暫存目錄，下次下載時清理
+
+
+def download_youtube_video(url):
+    """下載 YouTube 影片，回傳影片檔供預覽、音訊資料供片段擷取"""
+    global _yt_tmpdir
+    if not url or not url.strip():
+        return None, None, "請輸入 YouTube 網址"
+
+    try:
+        # 清理前次暫存
+        if _yt_tmpdir and os.path.isdir(_yt_tmpdir):
+            shutil.rmtree(_yt_tmpdir, ignore_errors=True)
+        _yt_tmpdir = tempfile.mkdtemp(prefix="voiceclone_yt_")
+
+        ydl_opts = {
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": os.path.join(_yt_tmpdir, "video.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url.strip(), download=True)
+            title = info.get("title", "未知")
+
+        # 找到下載的影片檔
+        video_files = [
+            f for f in os.listdir(_yt_tmpdir) if f.startswith("video.")
+        ]
+        if not video_files:
+            return None, None, "下載失敗：找不到影片檔案"
+        video_path = os.path.join(_yt_tmpdir, video_files[0])
+
+        # 用 ffmpeg 提取音訊
+        audio_path = os.path.join(_yt_tmpdir, "audio.wav")
+        subprocess.run(
+            ["ffmpeg", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+             "-ar", "16000", "-ac", "1", audio_path, "-y"],
+            capture_output=True, check=True,
+        )
+        wav, sr = sf.read(audio_path)
+        wav = _normalize_audio(wav)
+        duration = len(wav) / sr
+
+        return (
+            video_path,
+            (sr, wav),
+            f"下載成功！ 標題: {title} | 長度: {duration:.1f} 秒",
+        )
+    except Exception as e:
+        return None, None, f"下載失敗: {e}"
+
+
+def extract_youtube_segment(audio_state, start_sec, end_sec):
+    """從下載的音訊中擷取指定區段，送入參考音訊"""
+    if audio_state is None:
+        return None, "請先下載 YouTube 影片"
+
+    sr, wav = audio_state
+    total_duration = len(wav) / sr
+    start_sec = max(0.0, float(start_sec or 0))
+    end_sec = min(total_duration, float(end_sec or total_duration))
+
+    if end_sec <= start_sec:
+        return None, "結束時間必須大於開始時間"
+
+    seg_duration = end_sec - start_sec
+    if seg_duration > 30:
+        return None, "片段過長（建議 5~15 秒，最多 30 秒）"
+
+    start_sample = int(start_sec * sr)
+    end_sample = int(end_sec * sr)
+    segment = wav[start_sample:end_sample]
+
+    return (
+        (sr, segment),
+        f"已擷取 {start_sec:.1f}s ~ {end_sec:.1f}s（{seg_duration:.1f} 秒）",
+    )
 
 
 # ── 模型管理 ──────────────────────────────────────
@@ -325,10 +410,50 @@ def build_ui():
             # ── Tab 2: Voice Clone ──
             with gr.Tab("Voice Clone（聲音複製）"):
                 gr.Markdown("### 上傳參考音訊，複製該聲音來說任何內容")
+
+                # ── YouTube 擷取參考音訊 ──
+                with gr.Accordion("從 YouTube 影片擷取參考音訊", open=False):
+                    with gr.Row():
+                        yt_url = gr.Textbox(
+                            label="YouTube 網址",
+                            placeholder="貼上 YouTube 影片網址...",
+                            scale=3,
+                        )
+                        yt_download_btn = gr.Button(
+                            "下載影片", variant="secondary", scale=1,
+                        )
+                    yt_status = gr.Textbox(label="狀態", interactive=False)
+                    yt_video = gr.Video(
+                        label="播放影片，在想要的位置按下方按鈕標記起訖點",
+                        elem_id="yt-video",
+                    )
+                    yt_audio_state = gr.State(value=None)
+                    with gr.Row():
+                        yt_mark_start_btn = gr.Button(
+                            "標記開始", variant="secondary", scale=1,
+                        )
+                        yt_start = gr.Number(
+                            label="開始（秒）", value=0, minimum=0,
+                            interactive=False, scale=1,
+                        )
+                        yt_mark_end_btn = gr.Button(
+                            "標記結束", variant="secondary", scale=1,
+                        )
+                        yt_end = gr.Number(
+                            label="結束（秒）", value=0, minimum=0,
+                            interactive=False, scale=1,
+                        )
+                    yt_extract_btn = gr.Button(
+                        "擷取片段 → 送入參考音訊", variant="primary",
+                    )
+                    yt_seg_status = gr.Textbox(
+                        label="擷取狀態", interactive=False,
+                    )
+
                 with gr.Row():
                     with gr.Column(scale=2):
                         clone_ref_audio = gr.Audio(
-                            label="參考音訊（上傳 5~15 秒的聲音樣本）",
+                            label="參考音訊（上傳 5~15 秒的聲音樣本，或從上方 YouTube 擷取）",
                             type="numpy",
                         )
                         clone_ref_text = gr.Textbox(
@@ -357,6 +482,33 @@ def build_ui():
                                 label="模型大小", choices=MODEL_SIZES, value="1.7B",
                             )
                         clone_btn = gr.Button("複製聲音並合成", variant="primary")
+
+                # YouTube 事件綁定
+                yt_download_btn.click(
+                    download_youtube_video,
+                    inputs=[yt_url],
+                    outputs=[yt_video, yt_audio_state, yt_status],
+                )
+                # 標記按鈕：用 JS 讀取影片播放器的當前時間
+                yt_mark_start_btn.click(
+                    fn=None, inputs=None, outputs=[yt_start],
+                    js="""() => {
+                        const v = document.querySelector('#yt-video video');
+                        return v ? parseFloat(v.currentTime.toFixed(1)) : 0;
+                    }""",
+                )
+                yt_mark_end_btn.click(
+                    fn=None, inputs=None, outputs=[yt_end],
+                    js="""() => {
+                        const v = document.querySelector('#yt-video video');
+                        return v ? parseFloat(v.currentTime.toFixed(1)) : 0;
+                    }""",
+                )
+                yt_extract_btn.click(
+                    extract_youtube_segment,
+                    inputs=[yt_audio_state, yt_start, yt_end],
+                    outputs=[clone_ref_audio, yt_seg_status],
+                )
 
                 # 上傳音訊後自動辨識文字
                 clone_ref_audio.change(
