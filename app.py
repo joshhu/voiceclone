@@ -7,12 +7,13 @@ Qwen3-TTS 聲音複製與語音合成系統（本地版）
 2. Voice Clone - 用參考音訊複製任意聲音
 3. CustomVoice TTS - 使用預設角色聲音 + 情緒/風格控制
 
-針對 RTX 3080 Ti (12GB VRAM) 優化：一次只載入一個模型
+針對 NVIDIA GB10 (128GB VRAM) 優化：充分利用 CUDA GPU 加速
 """
 
 import os
 import tempfile
 import datetime
+import warnings
 
 import gradio as gr
 import numpy as np
@@ -21,6 +22,28 @@ import soundfile as sf
 import whisper
 from huggingface_hub import snapshot_download
 from qwen_tts import Qwen3TTSModel
+
+# 抑制 CUDA capability warning（GB10 compute 12.1 尚未正式支援但可正常運作）
+warnings.filterwarnings("ignore", message=".*cuda capability.*")
+
+# ── GPU 加速設定 ──────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+if torch.cuda.is_available():
+    # 啟用 TF32 加速矩陣運算（Ampere+ GPU，精度損失可忽略，速度提升顯著）
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # 啟用 cuDNN benchmark 自動選擇最快的卷積演算法
+    torch.backends.cudnn.benchmark = True
+    # 設定 float32 矩陣乘法精度為 high（使用 TF32）
+    torch.set_float32_matmul_precision("high")
+
+    _gpu_name = torch.cuda.get_device_name(0)
+    _vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"GPU 加速已啟用: {_gpu_name} ({_vram_gb:.0f} GB VRAM)")
+    print(f"  TF32: 啟用 | cuDNN benchmark: 啟用 | BF16: {torch.cuda.is_bf16_supported()}")
+else:
+    print("警告：CUDA 不可用，將使用 CPU 模式（速度極慢）")
 
 # ── 設定 ──────────────────────────────────────────
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
@@ -38,9 +61,8 @@ LANGUAGES = [
     "French", "German", "Spanish", "Portuguese", "Russian", "Italian",
 ]
 
-# 全域模型快取（本地 12GB VRAM 一次只保留一個模型）
-_current_model = None
-_current_model_key = None
+# 全域模型快取（128GB VRAM 可同時載入多個模型）
+_loaded_models = {}
 
 # Whisper ASR 模型快取
 _whisper_model = None
@@ -48,59 +70,37 @@ _whisper_model = None
 
 # ── ASR 語音辨識 ──────────────────────────────────
 def _load_whisper():
-    """載入 Whisper 模型（使用 turbo，速度快、品質好）"""
+    """載入 Whisper 模型到 GPU（VRAM 充足，常駐不卸載）"""
     global _whisper_model
     if _whisper_model is None:
-        print("正在載入 Whisper turbo 模型...")
-        _whisper_model = whisper.load_model("turbo", device="cuda")
+        print(f"正在載入 Whisper turbo 模型（{DEVICE}）...")
+        _whisper_model = whisper.load_model("turbo", device=DEVICE)
         print("Whisper 載入完成")
     return _whisper_model
 
 
-def _unload_whisper():
-    """釋放 Whisper 模型以騰出 VRAM 給 TTS"""
-    global _whisper_model
-    if _whisper_model is not None:
-        del _whisper_model
-        _whisper_model = None
-        torch.cuda.empty_cache()
-
-
+@torch.inference_mode()
 def transcribe_audio(audio):
-    """上傳音訊後自動辨識文字"""
+    """上傳音訊後自動辨識文字（GPU 加速推論）"""
     if audio is None:
         return ""
 
-    # 先釋放 TTS 模型騰出 VRAM
-    global _current_model, _current_model_key
-    if _current_model is not None:
-        del _current_model
-        _current_model = None
-        _current_model_key = None
-        torch.cuda.empty_cache()
-
     try:
-        # Gradio Audio type="numpy" 回傳 (sr, wav)
         sr, wav = audio
         wav = _normalize_audio(wav)
 
-        # Whisper 需要檔案路徑，存成暫存檔
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             sf.write(f.name, wav, sr)
             tmp_path = f.name
 
         model = _load_whisper()
-        result = model.transcribe(tmp_path)
+        # fp16 加速推論（GPU 模式下自動啟用）
+        result = model.transcribe(tmp_path, fp16=(DEVICE == "cuda"))
         text = result["text"].strip()
 
         os.unlink(tmp_path)
-
-        # 辨識完釋放 Whisper，給 TTS 留空間
-        _unload_whisper()
-
         return text
     except Exception as e:
-        _unload_whisper()
         return f"[辨識失敗: {e}]"
 
 
@@ -111,32 +111,37 @@ def get_model_path(model_type: str, model_size: str) -> str:
 
 
 def load_model(model_type: str, model_size: str):
-    """載入模型到 GPU，自動釋放前一個模型"""
-    global _current_model, _current_model_key
+    """載入模型到 GPU（128GB VRAM 可同時快取多個模型）"""
+    global _loaded_models
 
     key = f"{model_type}-{model_size}"
-    if _current_model_key == key and _current_model is not None:
-        return _current_model
-
-    # 釋放前一個模型
-    if _current_model is not None:
-        del _current_model
-        _current_model = None
-        _current_model_key = None
-        torch.cuda.empty_cache()
+    if key in _loaded_models:
+        return _loaded_models[key]
 
     model_path = get_model_path(model_type, model_size)
-    print(f"正在載入模型: {model_type} {model_size} ...")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    _current_model = Qwen3TTSModel.from_pretrained(
+    # 選擇最佳 attention 實作
+    attn_impl = "sdpa"  # PyTorch 原生 Scaled Dot-Product Attention（支援 Flash Attention 後端）
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"  # 如果有安裝 flash-attn，使用更快的 FA2
+    except ImportError:
+        pass
+
+    print(f"正在載入模型: {model_type} {model_size} （{DEVICE}, {dtype}, attn={attn_impl}）...")
+
+    model = Qwen3TTSModel.from_pretrained(
         model_path,
-        device_map="cuda",
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        device_map=DEVICE,
+        dtype=dtype,
+        attn_implementation=attn_impl,
     )
-    _current_model_key = key
-    print(f"模型載入完成: {key}")
-    return _current_model
+
+    _loaded_models[key] = model
+    used = torch.cuda.memory_allocated(0) / 1024**3 if torch.cuda.is_available() else 0
+    print(f"模型載入完成: {key} | VRAM 已用: {used:.1f} GB")
+    return model
 
 
 # ── 音訊工具 ──────────────────────────────────────
@@ -199,11 +204,13 @@ def _gpu_status():
     if torch.cuda.is_available():
         used = torch.cuda.memory_allocated(0) / 1024**3
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        return f"VRAM: {used:.1f} / {total:.1f} GB"
-    return "CPU 模式"
+        cached = len(_loaded_models)
+        return f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {used:.1f} / {total:.0f} GB | 快取模型: {cached}"
+    return "CPU 模式（未使用 GPU）"
 
 
 # ── 生成函式 ──────────────────────────────────────
+@torch.inference_mode()
 def generate_voice_design(text, language, voice_description):
     """Voice Design：用自然語言描述設計聲音（僅 1.7B）"""
     if not text or not text.strip():
@@ -226,6 +233,7 @@ def generate_voice_design(text, language, voice_description):
         return None, f"錯誤: {type(e).__name__}: {e}"
 
 
+@torch.inference_mode()
 def generate_voice_clone(ref_audio, ref_text, target_text, language,
                          use_xvector_only, model_size):
     """Voice Clone：用參考音訊複製聲音"""
@@ -255,6 +263,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language,
         return None, f"錯誤: {type(e).__name__}: {e}"
 
 
+@torch.inference_mode()
 def generate_custom_voice(text, language, speaker, instruct, model_size):
     """CustomVoice TTS：使用預設角色聲音"""
     if not text or not text.strip():
@@ -417,7 +426,7 @@ def build_ui():
 
         gr.Markdown("""
 ---
-**本地部署版** | 12GB VRAM 一次載入一個模型，切換時自動釋放 | 輸出儲存於 `outputs/` 目錄
+**本地 GPU 加速版** | CUDA + BF16 + SDPA/Flash Attention | 多模型同時快取 | 輸出儲存於 `outputs/` 目錄
 """)
 
     return demo
