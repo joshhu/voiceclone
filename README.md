@@ -1,6 +1,6 @@
 # VoiceClone - Qwen3-TTS 聲音複製與語音合成系統
 
-基於 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 的本地聲音複製與語音合成系統，提供 Gradio 網頁介面和 CLI 命令列工具。
+基於 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 的本地聲音複製與語音合成系統，提供 Gradio 網頁介面和 CLI 命令列工具。支援 CUDA GPU 加速，充分利用 BF16、TF32、Flash Attention 等技術提升推論速度。
 
 ## 功能
 
@@ -12,7 +12,16 @@
 
 - 支援 10 種語言：中文、英文、日文、韓文、德文、法文、俄文、葡萄牙文、西班牙文、義大利文
 - Voice Clone 上傳音訊後，自動使用 Whisper 辨識參考文字
-- VRAM 智慧管理：一次只載入一個模型，切換時自動釋放
+- 多模型同時快取：VRAM 充足時可同時載入多個模型，無需切換等待
+
+## GPU 加速特性
+
+- **CUDA 自動偵測**：有 GPU 自動啟用 CUDA，無 GPU 自動退回 CPU 模式
+- **BF16 推論**：使用 bfloat16 精度，大幅降低 VRAM 用量與加速運算
+- **TF32 矩陣加速**：Ampere 架構以上 GPU 自動啟用 TF32
+- **cuDNN Benchmark**：自動選擇最快的卷積演算法
+- **SDPA / Flash Attention 2**：自動偵測並使用最佳 Attention 實作
+- **`torch.inference_mode()`**：推論時關閉梯度追蹤，減少記憶體開銷
 
 ## 硬體需求
 
@@ -20,8 +29,9 @@
 |------|-----------|----------|
 | 0.6B | ~2-4 GB | RTX 3060 (12GB) 以上 |
 | 1.7B | ~4-6 GB | RTX 3080 Ti (12GB) 以上 |
+| 多模型同時載入 | ~10-12 GB | RTX 4090 (24GB) 以上 |
 
-> 已在 RTX 3080 Ti (12GB VRAM) 上測試通過。
+> 已在 NVIDIA GB10 (128GB VRAM) 上測試通過。
 
 ## 快速開始
 
@@ -79,7 +89,7 @@ uv run python clone.py custom "Hello!" --speaker Ryan --small
 
 ```
 voiceclone/
-├── app.py           # Gradio 網頁介面
+├── app.py           # Gradio 網頁介面（GPU 加速版）
 ├── clone.py         # CLI 命令列工具
 ├── outputs/         # 合成音訊輸出目錄
 ├── ref_audio/       # 參考音訊目錄（聲音複製用）
